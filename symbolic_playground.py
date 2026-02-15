@@ -4,7 +4,7 @@ import argparse
 from nn import SudokuNet, load_kaggle_data
 from symbolic_layer import ArgmaxLayer, MaxSATLayer, LPLayer, QUBOLayer
 from environment import SudokuRLEnv
-from rl_optimizer import RandomSearchOptimizer, EvolutionStrategyOptimizer
+from rl_optimizer import RandomSearchOptimizer, EvolutionStrategyOptimizer, EggrollOptimizer
 
 def main():
     parser = argparse.ArgumentParser(description="Sudoku Symbolic Layer Workbench")
@@ -12,7 +12,7 @@ def main():
                         choices=['argmax', 'maxsat', 'lp', 'qubo'],
                         help="Symbolic layer type")
     parser.add_argument('--optimizer', type=str, default='random',
-                        choices=['random', 'es'],
+                        choices=['random', 'es', 'eggroll'],
                         help="Gradient-free optimizer type")
     parser.add_argument('--samples', type=int, default=10,
                         help="Number of samples to evaluate on per step")
@@ -40,20 +40,39 @@ def main():
 
     # 2. Load Model
     print(f"Loading Model from {args.model_path}...")
-    # Initialize model structure (must match training)
-    model = SudokuNet(hidden_sizes=[256, 256]) # CAUTION: Ensure this matches the saved model structure!
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     try:
-        # We need to handle map_location to cpu if no cuda
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         checkpoint = torch.load(args.model_path, map_location=device)
         if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict = checkpoint['model_state_dict']
         else:
-            model.load_state_dict(checkpoint) # In case user saved just state_dict
+            state_dict = checkpoint
+
+        # Infer hidden sizes
+        hidden_sizes = []
+        layer_indices = []
+        for key in state_dict.keys():
+            if key.startswith("network.") and key.endswith(".weight"):
+                parts = key.split('.')
+                if len(parts) == 3 and parts[1].isdigit():
+                    layer_indices.append(int(parts[1]))
+        
+        layer_indices.sort()
+        
+        # The last one is the output layer
+        for idx in layer_indices[:-1]:
+            weight = state_dict[f'network.{idx}.weight']
+            hidden_sizes.append(weight.shape[0])
+            
+        print(f"Detected hidden sizes from checkpoint: {hidden_sizes}")
+        model = SudokuNet(hidden_sizes=hidden_sizes)
+        model.load_state_dict(state_dict)
         print("Model loaded successfully.")
     except Exception as e:
         print(f"Could not load model: {e}")
-        print("Using initialized model (random weights).")
+        print("Using initialized model (random weights) with default [256, 256].")
+        model = SudokuNet(hidden_sizes=[256, 256])
 
     # 3. Setup Symbolic Layer
     if args.layer == 'argmax':
@@ -75,7 +94,9 @@ def main():
         optimizer = RandomSearchOptimizer(env, model.parameters(), population_size=5, sigma=0.01)
     elif args.optimizer == 'es':
         optimizer = EvolutionStrategyOptimizer(env, model.parameters())
-        
+    elif args.optimizer == 'eggroll':
+         optimizer = EggrollOptimizer(env, model.parameters(), population_size=10, sigma=0.1, learning_rate=0.01)
+
     # 6. Run Loop
     print("\nStarting Optimization Loop...")
     for step in range(args.steps):
